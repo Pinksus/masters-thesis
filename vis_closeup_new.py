@@ -12,51 +12,96 @@ from nuscenes.nuscenes import NuScenes
 from scipy.optimize import minimize, differential_evolution
 from pyquaternion import Quaternion
 
+import numpy as np
+from nuscenes.utils.data_classes import Box
+from pyquaternion import Quaternion
+from copy import deepcopy
 
-def global_to_lidar(nusc, p_global, lidar_token):
+def avg_distance_to_box_walls(box: Box, pts):
     """
-    Convert a point from global coordinates to LIDAR_TOP coordinates of a sample.
+    Vypočíta priemernú vzdialenosť bodov od stien boxu.
+    - body musia byť vo vnútri boxu
+    """
+    # transform points to box local frame
+    R = box.orientation.rotation_matrix
+    t = box.center
+    pts_local = (pts - t) @ R
+
+    # nuScenes axes: x=length, y=width, z=height
+    l, w, h = box.wlh[1], box.wlh[0], box.wlh[2]
+    half = np.array([l/2, w/2, h/2])
+
+    # vzdialenosť od stien = min(half - abs(coord))
+    dist_x = half[0] - np.abs(pts_local[:,0])
+    dist_y = half[1] - np.abs(pts_local[:,1])
+    dist_z = half[2] - np.abs(pts_local[:,2])
+
+    # priemer cez všetky body a všetky osi
+    avg_dist = np.mean(np.minimum(dist_x, np.minimum(dist_y, dist_z)))
+    return avg_dist
+
+
+def objective_fn_centering(params, box: Box, pts_inside):
+    """
+    Posun (dx, dy) a rotácia (dtheta) boxu, aby sa body
+    viac centrovali v boxe.
+    """
+    dx, dy, dtheta = params
+    new_box = transform_box(box, dx, dy, dtheta)
+    # všetky body vo vnútri boxu
+    pts_local_inside = crop_points_to_prev_box(pts_inside, new_box, scale=1.0)
     
-    p_global: np.array([x, y, z])
-    lidar_token: sample_data token for LIDAR_TOP
+    # priemerna vzdialenost od stien
+    avg_dist = avg_distance_to_box_walls(new_box, pts_local_inside)
+    
+    return avg_dist  # minimalizujeme
+
+
+def transform_box(box: Box, dx=0.0, dy=0.0, dtheta=0.0):
     """
-    # 1. Load sensor + ego pose
-    sd = nusc.get('sample_data', lidar_token)
-    cs = nusc.get('calibrated_sensor', sd['calibrated_sensor_token'])
-    ep = nusc.get('ego_pose', sd['ego_pose_token'])
-
-    # 2. Transform: global → ego
-    p_ego = Quaternion(ep['rotation']).inverse.rotate(p_global - np.array(ep['translation']))
-
-    # 3. Transform: ego → lidar
-    p_lidar = Quaternion(cs['rotation']).inverse.rotate(p_ego - np.array(cs['translation']))
-
-    return p_lidar
-
-
-def scale_box(box: Box, scale=1.5):
+    Posunie box o dx, dy a otočí okolo Z osi o dtheta (v radiánoch)
     """
-    Returns a scaled copy of the NuScenes Box (scale is multiplicative).
-    """
-    new_box = copy.deepcopy(box)
-    new_box.wlh[0] = box.wlh[0] * scale
-    new_box.wlh[1] = box.wlh[1] * scale
+    new_box = deepcopy(box)
+    
+    # Posun
+    new_box.center[0] += dx
+    new_box.center[1] += dy
+    
+    # Rotácia okolo Z
+    q = Quaternion(axis=[0,0,1], radians=dtheta)
+    new_box.orientation = q * new_box.orientation
+    
     return new_box
 
+def objective_fn(params, box: Box, pts):
+    """
+    params = [dx, dy, dtheta]
+    Cieľ: maximalizovať počet bodov v boxe
+    """
+    dx, dy, dtheta = params
+    new_box = transform_box(box, dx, dy, dtheta)
+    
+    # použijeme tvoju crop_points_to_prev_box funkciu
+    pts_inside = crop_points_to_prev_box(pts, new_box, scale=1.0)
+    
+    # mínus, lebo minimize() minimalizuje
+    return -len(pts_inside)
 
-def crop_points_to_prev_box_old(scene_pts, prev_box, scale=1.5):
-    """Crop lidar points around previous box, enlarged by `scale`."""
-    center, yaw, half_sizes = box_to_params_nusc(prev_box)
+from scipy.optimize import minimize
 
-    # zväčšíme box (napr. 1.5x)
-    half_sizes = half_sizes * scale
-
-    # body do lokálneho systému
-    local = rotate_points_inverse(scene_pts, center, yaw)
-
-    # inside mask
-    inside = np.all(np.abs(local) <= half_sizes, axis=1)
-    return scene_pts[inside]
+def fit_box_to_points(box: Box, pts, max_iter=100):
+    """
+    Nájde dx, dy, dtheta, ktoré maximalizujú počet bodov vo vnútri boxu
+    """
+    x0 = [0.0, 0.0, 0.0]  # začneme bez posunu
+    res = minimize(objective_fn, x0, args=(box, pts),
+                   method='Powell',  # robustný pre malé dimenzie
+                   options={'maxiter': max_iter, 'disp': True})
+    
+    dx_opt, dy_opt, dtheta_opt = res.x
+    box_fitted = transform_box(box, dx_opt, dy_opt, dtheta_opt)
+    
+    return box_fitted, res
 
 
 def crop_points_to_prev_box(scene_pts, box: Box, scale=1.5):
@@ -66,6 +111,8 @@ def crop_points_to_prev_box(scene_pts, box: Box, scale=1.5):
     # scaled box
     scaled = copy.deepcopy(box)
     scaled.wlh[:2] *= scale
+
+    print(f"crop_points_to_prev_box: {scaled}")
 
     # get transform world->box
     R = scaled.orientation.rotation_matrix  # 3×3
@@ -77,12 +124,10 @@ def crop_points_to_prev_box(scene_pts, box: Box, scale=1.5):
 
     # half sizes
     w, l, h = scaled.wlh
-    half = np.array([w/2, l/2, h/2])
+    half = np.array([l/2, w/2, h/2])
 
     inside = np.all(np.abs(pts_local) <= half, axis=1)
     return scene_pts[inside]
-
-
 
 
 def box_to_params_nusc(box: Box):
@@ -97,85 +142,6 @@ def box_to_params_nusc(box: Box):
     return center, yaw, half_sizes
 
 
-def rotate_points_inverse(points, center, yaw):
-    """Rotate world points into local box frame."""
-    c = np.cos(-yaw)
-    s = np.sin(-yaw)
-    R = np.array([[c, -s, 0],
-                  [s,  c, 0],
-                  [0,  0, 1]])
-    return (points - center) @ R.T
-
-
-def distance_points_to_aabb(local_points, half_sizes):
-    """Distance of each point to axis-aligned box in local frame."""
-    d = np.abs(local_points) - half_sizes
-    d = np.maximum(d, 0)
-    return np.linalg.norm(d, axis=1)
-
-
-def box_fit_cost(params, scene_pts, base_center, base_yaw, half_sizes):
-    dx, dy, dyaw = params
-
-    cand_center = base_center + np.array([dx, dy, 0])
-    cand_yaw = base_yaw + dyaw
-
-    pts_local = rotate_points_inverse(scene_pts, cand_center, cand_yaw)
-    dists = distance_points_to_aabb(pts_local, half_sizes)
-
-    inside = dists < 1e-5
-    frac_inside = inside.sum() / len(dists)
-
-    mean_out = np.mean(dists[~inside]) if (~inside).any() else 0.0
-
-    cost = mean_out + 10 * (1 - frac_inside)
-    return cost
-
-
-def optimize_box(scene_pts, prev_box: Box, search_xy=2.0, search_yaw=0.5):
-    """Optimize the previous box to fit the current lidar point cloud."""
-
-     # === NEW: crop points around previous box ===
-    cropped = crop_points_to_prev_box(scene_pts, prev_box, scale=1.5)
-    if len(cropped) < 20:
-        print("Warning: too few points for optimization; skipping.")
-        return prev_box
-
-    scene_pts = cropped
-
-    base_center, base_yaw, half_sizes = box_to_params_nusc(prev_box)
-
-    x0 = np.array([0.0, 0.0, 0.0])  # dx, dy, dyaw
-
-    bounds = [(-search_xy, search_xy),
-              (-search_xy, search_xy),
-              (-search_yaw, search_yaw)]
-
-    # Global search
-    de = differential_evolution(
-        lambda p: box_fit_cost(p, scene_pts, base_center, base_yaw, half_sizes),
-        bounds, maxiter=40, polish=False
-    )
-
-    # Local refine
-    res = minimize(
-        lambda p: box_fit_cost(p, scene_pts, base_center, base_yaw, half_sizes),
-        de.x, method='Powell'
-    )
-
-    dx, dy, dyaw = res.x
-
-    new_center = base_center + np.array([dx, dy, 0])
-    new_yaw = base_yaw + dyaw
-
-    # Construct nuScenes box
-    new_box = copy.deepcopy(prev_box)
-    new_box.center = new_center.tolist()
-    new_box.orientation = Quaternion(axis=[0, 0, 1], angle=new_yaw)
-
-    return new_box
-
-
 def get_color(category_name: str) -> tuple[int, int, int]:
         """
         Provides the default colors based on the category names.
@@ -183,6 +149,27 @@ def get_color(category_name: str) -> tuple[int, int, int]:
         """
 
         return nusc.colormap[category_name]
+
+
+from scipy.optimize import minimize
+
+def fit_box_two_step(box: Box, pts, max_iter=100):
+    # --- krok 1: maximalizácia počtu bodov ---
+    fitted_box, res1 = fit_box_to_points(box, pts, max_iter=max_iter)
+    
+    # --- krok 2: minimalizácia priemernej vzdialenosti od stien ---
+    # vyber body vo vnútri fitted_box
+    pts_inside = crop_points_to_prev_box(pts, fitted_box, scale=1.0)
+    
+    # optimalizácia posunu + rotácie
+    x0 = [0.0, 0.0, 0.0]
+    res2 = minimize(objective_fn_centering, x0, args=(fitted_box, pts_inside),
+                    method='Powell', options={'maxiter': max_iter, 'disp': True})
+    
+    dx_opt, dy_opt, dtheta_opt = res2.x
+    final_box = transform_box(fitted_box, dx_opt, dy_opt, dtheta_opt)
+    
+    return final_box, res1, res2
 
 
 def render_annotation(nusc,
@@ -263,21 +250,23 @@ def render_annotation(nusc,
     #       RENDERING
     # ============================
     pc = LidarPointCloud.from_file(lidar_path)
+    pts = pc.points.T[:, :3]   # (x,y,z)
 
-    fig, ax = plt.subplots(1, 1, figsize=(18, 10))
+
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(18, 10))
     fig.tight_layout()
 
     # pointcloud
-    pc.render_height(ax, view=view)
+    pc.render_height(ax_left, view=view)
 
     # CURRENT BOX — original color
     c_curr = np.array(get_color(box_curr.name)) / 255.0
-    box_curr.render(ax, view=view, colors=(c_curr, c_curr, c_curr))
+    box_curr.render(ax_left, view=view, colors=(c_curr, c_curr, c_curr))
 
     # PREVIOUS BOX — blue
     if prev_box_transformed is not None:
         c_prev = np.array([0.0, 0.0, 1.0])
-        prev_box_transformed.render(ax, view=view, colors=(c_prev, c_prev, c_prev))
+        prev_box_transformed.render(ax_left, view=view, colors=(c_prev, c_prev, c_prev))
         print("Previous box transformed to current LIDAR frame:", prev_box_transformed.center)
     else:
         print("OBJECT DOES NOT EXIST in previous frame.")
@@ -287,13 +276,66 @@ def render_annotation(nusc,
     scaled_prev.wlh = prev_box_transformed.wlh * 1.5
 
     c_scaled = np.array([1.0, 0.0, 0.0])  # red
-    scaled_prev.render(ax, view=view, colors=(c_scaled, c_scaled, c_scaled))
+    scaled_prev.render(ax_left, view=view, colors=(c_scaled, c_scaled, c_scaled))
 
     # autoscale
     corners = view_points(box_curr.corners(), view, False)[:2, :]
-    ax.set_xlim([np.min(corners[0]) - margin, np.max(corners[0]) + margin])
-    ax.set_ylim([np.min(corners[1]) - margin, np.max(corners[1]) + margin])
-    ax.set_aspect('equal')
+    ax_left.set_xlim([np.min(corners[0]) - margin, np.max(corners[0]) + margin])
+    ax_left.set_ylim([np.min(corners[1]) - margin, np.max(corners[1]) + margin])
+    ax_left.set_aspect('equal')
+    ax_left.set_title("LIDAR + Boxes")
+
+    # ============================
+    #       RIGHT PLOT (BEV)
+    # ============================
+
+    # Použijeme tvoju funkciu na výber bodov vo vnútri boxu
+    inside_pts = crop_points_to_prev_box(pts, prev_box_transformed)
+    # scale=1.0 → pretože scaled_prev.wlh je už zväčšený o 1.5x
+
+    # BEV scatter
+    ax_right.scatter(inside_pts[:, 0], inside_pts[:, 1], s=2)
+
+    order = [3,7,6,2,3]
+
+    # scaled box (red)
+    corn_scaled = scaled_prev.corners().T
+    ax_right.plot(
+        corn_scaled[order, 0],
+        corn_scaled[order, 1],
+        linewidth=2,
+        color='red',
+        label='scaled prev box'
+    )
+
+    # original prev box (blue)
+    corn_prev = prev_box_transformed.corners().T
+    ax_right.plot(
+        corn_prev[order, 0],
+        corn_prev[order, 1],
+        linewidth=2,
+        linestyle='--',
+        color='blue',
+        label='original prev box'
+    )
+
+    # inside_pts = pôvodne cropované body
+    fitted_box, result = fit_box_to_points(prev_box_transformed, inside_pts)
+
+    # nakreslíme fitted box v BEV
+    corn_fitted = fitted_box.corners().T
+    order = [3,7,6,2,3]
+    ax_right.plot(
+        corn_fitted[order,0],
+        corn_fitted[order,1],
+        color='green',
+        linewidth=2,
+        label='fitted prev box'
+    )
+
+    ax_right.legend()
+    ax_right.set_aspect('equal')
+    ax_right.set_title("BEV: original vs scaled prev box")
 
     plt.show()
 
