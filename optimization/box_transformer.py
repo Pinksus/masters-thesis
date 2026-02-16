@@ -1,6 +1,6 @@
-from matplotlib.dviread import Box
+from nuscenes.utils.data_classes import Box
 import numpy as np
-from sympy import Quaternion
+from pyquaternion import Quaternion
 
 
 class BoxTransformer:

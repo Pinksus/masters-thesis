@@ -339,10 +339,6 @@ def render_annotation(nusc,
 
     plt.show()
 
-
-
-
-
 nusc = NuScenes(version='v1.0-mini', dataroot='../nuscenes')
 
 sample = nusc.sample[56]
