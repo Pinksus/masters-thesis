@@ -75,7 +75,7 @@ class BEVFitUtils:
             rotated += center
             return BEVFitUtils.compute_avg_distance(points, rotated)
 
-        # ⛔ OBMEDZENIE ROTÁCIE
+        #  OBMEDZENIE ROTÁCIE
         res = minimize_scalar(
             yaw_cost,
             bounds=(-MAX_YAW_DELTA, MAX_YAW_DELTA),

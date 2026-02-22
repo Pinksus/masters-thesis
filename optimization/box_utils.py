@@ -14,8 +14,6 @@ class BoxUtils:
         scaled = copy.deepcopy(box)
         scaled.wlh[:2] *= scale
 
-        #print(f"crop_points_to_prev_box: {scaled}")
-
         # get transform world->box
         R = scaled.orientation.rotation_matrix  # 3×3
         t = scaled.center

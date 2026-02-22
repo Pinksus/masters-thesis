@@ -84,4 +84,3 @@ class Visualizer:
         #plt.close('all') 
 
         plt.show()
-
