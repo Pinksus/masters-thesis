@@ -17,7 +17,7 @@ from pyquaternion import Quaternion
 from scipy.spatial import ConvexHull
 
 # ---- project imports (uprav podľa projektu) ----
-from box_utils import BoxUtils
+from box_utils.box_utils import BoxUtils
 from bev_fit_utils import BEVFitUtils
 
 

@@ -3,9 +3,9 @@ from nuscenes.utils.data_classes import LidarPointCloud, Box
 import numpy as np
 import copy
 from nuscenes.utils.geometry_utils import view_points
-from box_utils import BoxUtils
-from annotation_loader import AnnotationLoader
-from box_transformer import BoxTransformer
+from box_utils.box_utils import BoxUtils
+from annotation_utils.annotation_loader import AnnotationLoader
+from box_utils.box_transformer import BoxTransformer
 from bev_plotter import BEVPlotter
 from nuscenes.utils.geometry_utils import view_points
 

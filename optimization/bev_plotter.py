@@ -1,4 +1,4 @@
-from box_utils import BoxUtils
+from box_utils.box_utils import BoxUtils
 import numpy as np
 from scipy.optimize import minimize
 import copy

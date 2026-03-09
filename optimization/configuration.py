@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass
@@ -21,6 +22,8 @@ class NuScenesConfig:
     # ================================
     MIN_SPEED_KMH: float = 5.0
     MAX_SPEED_KMH: float = 100.0
+    MIN_SPEED_MS: float = MIN_SPEED_KMH / 3.6
+    MAX_SPEED_MS: float = MAX_SPEED_KMH / 3.6
 
     # ================================
     # LiDAR timing
@@ -35,7 +38,10 @@ class NuScenesConfig:
     # ================================
     # Logging
     # ================================
-    TIME_LOG_PATH: str = "sample_processing_time.txt"
+    timestamp: str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+    TIME_LOG_PATH: str = f"outputs/{timestamp}_sample_processing_time.txt"
+    IOU_LOG_PATH: str = f"outputs/{timestamp}_iou_log.txt"
 
     # ================================
     # Debug

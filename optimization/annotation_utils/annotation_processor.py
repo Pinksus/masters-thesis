@@ -2,9 +2,9 @@ import copy
 import numpy as np
 from nuscenes.utils.data_classes import LidarPointCloud
 
-from annotation_loader import AnnotationLoader
-from box_transformer import BoxTransformer
-from box_optimizer import BoxOptimizer
+from annotation_utils.annotation_loader import AnnotationLoader
+from box_utils.box_transformer import BoxTransformer
+from box_utils.box_optimizer import BoxOptimizer
 
 
 class AnnotationProcessor:
