@@ -7,7 +7,33 @@ from matplotlib.patches import Ellipse
 from tqdm import tqdm
 
 
+# ───────────────── constants ─────────────────
+
+TURN_RADIUS_GEOMETRIC = 3.8   # Smart ForTwo — mechanický limit [m]
+MU   = 0.8                    # koeficient bočného trenia pneumatík
+G    = 9.81                   # gravitačné zrýchlenie [m/s²]
+DT   = 0.5                    # časový krok [s]
+
+
 # ───────────────── helpers ─────────────────
+
+def effective_turn_radius(speed_ms,
+                          r_geom=TURN_RADIUS_GEOMETRIC,
+                          mu=MU, g=G):
+    """
+    Skutočný minimálny polomer otáčania pri danej rýchlosti.
+
+    Sú dva limity:
+      1. Geometrický (volant nadoraz):  r_geom = 3.8 m
+      2. Trecia sila pneumatík:         r_friction = v² / (μ·g)
+
+    Efektívny polomer = max z oboch — pri nízkych rýchlostiach
+    dominuje geometria, pri vysokých dominuje trecia sila.
+
+    Crossover ≈ sqrt(r_geom · μ · g) = sqrt(3.8·0.8·9.81) ≈ 5.5 m/s ≈ 20 km/h
+    """
+    r_friction = speed_ms ** 2 / (mu * g)
+    return max(r_geom, r_friction)
 
 def width_scale_by_speed(speed_avg_kmh, min_speed=0, max_speed=70):
     min_width = 0.4
@@ -47,6 +73,35 @@ def draw_car_box(ax, center, size, yaw, color="red", linewidth=2):
     rotated = corners @ R.T + center[:2]
     ax.plot(rotated[:, 0], rotated[:, 1], color=color, linewidth=linewidth)
 
+def draw_turning_cone(ax, arc_length, r_eff):
+    """
+    Nakreslí hranicu kužeľa otáčania.
+
+    arc_length = max. dráha za DT sekúnd  (= v·dt + 0.5·a·dt²)
+    r_eff      = efektívny polomer otáčania pri danej rýchlosti
+
+    Maximálny uhol:   theta_max = min(arc_length / r_eff, pi/2)
+    Maximálne x:      x_max = r_eff · sin(theta_max)
+    Bočná hranica:    y_max(x) = r_eff - sqrt(r_eff² - x²)
+
+    Pri vysokej rýchlosti je r_eff >> r_geom → kužeľ je úzky.
+    Pri nízkej rýchlosti je r_eff = r_geom  → kužeľ je najširší.
+    """
+    theta_max = min(arc_length / r_eff, np.pi / 2)
+    x_max = r_eff * np.sin(theta_max)
+
+    x_vals = np.linspace(0, x_max, 300)
+    y_upper = r_eff - np.sqrt(np.maximum(r_eff**2 - x_vals**2, 0))
+    y_lower = -y_upper
+
+    label = (f"Turning cone  r_eff={r_eff:.1f}m  "
+             f"θ_max={np.degrees(theta_max):.1f}°")
+
+    ax.plot(x_vals, y_upper, color="green", linewidth=2, linestyle="-", label=label)
+    ax.plot(x_vals, y_lower, color="green", linewidth=2, linestyle="-")
+    ax.plot([x_max, x_max], [y_lower[-1], y_upper[-1]],
+            color="green", linewidth=2, linestyle="-")
+
 def compute_average_car_size(nusc):
     sizes = [
         ann["size"]
@@ -56,19 +111,40 @@ def compute_average_car_size(nusc):
     return np.array(sizes).mean(axis=0)
 
 
-# ───────────────── outlier check ─────────────────
+# ───────────────── outlier checks ─────────────────
 
 def is_outside_ellipse(point, radius, width_scale):
+    x, y = point
+    a = radius
+    b = radius * width_scale
+    return (x / a) ** 2 + (y / b) ** 2 > 1.0
+
+def is_outside_turning_cone(point, arc_length, r_eff):
     """
-    Vráti True ak bod leží mimo elipsy.
-    Elipsa je vycentrovaná v (0,0):
-      - polos x (forward) = radius
-      - polos y (lateral) = radius * width_scale
+    Vráti True ak bod leží mimo kužeľa otáčania.
+
+    r_eff = effective_turn_radius(speed_ms) — závisí od rýchlosti:
+      - nízka rýchlosť (~5 km/h):  r_eff ≈ 3.8m  → kužeľ relatívne široký
+      - vysoká rýchlosť (60 km/h): r_eff ≈ 35m   → kužeľ veľmi úzky
+        (auto nemôže prudko zatočiť bez šmyku)
     """
     x, y = point
-    a = radius          # polos v smere jazdy (x)
-    b = radius * width_scale   # polos do strany (y)
-    return (x / a) ** 2 + (y / b) ** 2 > 1.0
+
+    if x < 0:
+        return True
+
+    theta_max = min(arc_length / r_eff, np.pi / 2)
+    x_max = r_eff * np.sin(theta_max)
+
+    if x > x_max:
+        return True
+
+    if x >= r_eff:
+        y_limit = r_eff
+    else:
+        y_limit = r_eff - np.sqrt(r_eff**2 - x**2)
+
+    return abs(y) > y_limit
 
 
 # ───────────────── MAIN LOGIC ─────────────────
@@ -123,10 +199,10 @@ def collect_data(nusc, max_speed=70, bin_size=2):
     return bins
 
 
-def plot_bins(bins, avg_size, bin_size=2, output_dir="examples_5"):
+def plot_bins(bins, avg_size, bin_size=2, output_dir="examples_6"):
     os.makedirs(output_dir, exist_ok=True)
 
-    outlier_counts = {}  # { "0-2 km/h": count, ... }
+    outlier_counts = {}
 
     for bin_idx, data in bins.items():
         pts = data["pts"]
@@ -142,15 +218,17 @@ def plot_bins(bins, avg_size, bin_size=2, output_dir="examples_5"):
         speed_avg_kmh = (v_min + v_max) / 2
         speed_ms = speed_avg_kmh / 3.6
 
-        # ── elipsa parametre ──
-        dt = 0.5
+        # ── parametre ──
         a = accel_by_speed(speed_avg_kmh)
-        radius = speed_ms * dt + 0.5 * a * dt**2
-        width_scale = width_scale_by_speed(speed_avg_kmh, min_speed=0, max_speed=70)
+        arc_length  = speed_ms * DT + 0.5 * a * DT**2
+        width_scale = width_scale_by_speed(speed_avg_kmh)
+        r_eff       = effective_turn_radius(speed_ms)
 
-        # ── rozdeľ body na inliers / outliers ──
+        # ── rozdeľ body ──
         outside_mask = np.array([
-            is_outside_ellipse(p, radius, width_scale) for p in pts
+            is_outside_ellipse(p, arc_length, width_scale) or
+            is_outside_turning_cone(p, arc_length, r_eff)
+            for p in pts
         ])
         inliers  = pts[~outside_mask]
         outliers = pts[ outside_mask]
@@ -161,7 +239,6 @@ def plot_bins(bins, avg_size, bin_size=2, output_dir="examples_5"):
         # ── plot ──
         fig, ax = plt.subplots(figsize=(10, 10))
 
-        # inliers — farba podľa rýchlosti
         if len(inliers) > 0:
             inlier_speeds = np.array(speeds)[~outside_mask]
             sc = ax.scatter(
@@ -171,7 +248,6 @@ def plot_bins(bins, avg_size, bin_size=2, output_dir="examples_5"):
             )
             plt.colorbar(sc, ax=ax, label="Speed (km/h)")
 
-        # outliers — červená bodka
         if len(outliers) > 0:
             ax.scatter(
                 outliers[:, 0], outliers[:, 1],
@@ -181,25 +257,32 @@ def plot_bins(bins, avg_size, bin_size=2, output_dir="examples_5"):
 
         draw_car_box(ax, center=np.array([0, 0, 0]), size=avg_size, yaw=0)
         ax.scatter(0, 0, s=150, color="red", zorder=6)
-
         ax.annotate("", xy=(avg_size[1], 0), xytext=(0, 0),
                     arrowprops=dict(arrowstyle="->", color="red", lw=2))
 
+        # elipsa (modrá prerušovaná)
         ellipse = Ellipse(
             (0, 0),
-            width=radius * 2,
-            height=radius * width_scale * 2,
-            edgecolor='blue',
+            width=arc_length * 2,
+            height=arc_length * width_scale * 2,
+            edgecolor="blue",
             fill=False,
-            linestyle='--',
-            linewidth=2
+            linestyle="--",
+            linewidth=2,
+            label="Ellipse boundary"
         )
         ax.add_patch(ellipse)
 
+        # kužeľ otáčania (zelený) — závisí od r_eff(v)
+        draw_turning_cone(ax, arc_length, r_eff)
+
         total = len(pts)
         pct = 100 * len(outliers) / total if total > 0 else 0
+        theta_max_deg = np.degrees(min(arc_length / r_eff, np.pi / 2))
+
         ax.set_title(
             f"{v_min}-{v_max} km/h  |  "
+            f"arc={arc_length:.2f}m  r_eff={r_eff:.1f}m  θ_max={theta_max_deg:.1f}°  |  "
             f"outliers: {len(outliers)}/{total} ({pct:.1f}%)"
         )
         ax.set_xlim(-5, 25)
